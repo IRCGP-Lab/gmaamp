@@ -39,7 +39,7 @@ Due to size constraints, the Kraken2 database is NOT included in the package. Yo
 kraken2-build --standard --threads 16 --db my_kraken_db
 
 # Option B: Download Pre-built Index (e.g., Ben Langmead's Index)
-# [https://benlangmead.github.io/aws-indexes/k2](https://benlangmead.github.io/aws-indexes/k2)
+[https://benlangmead.github.io/aws-indexes/k2](https://benlangmead.github.io/aws-indexes/k2)
 ```
 
 ### 3. Usage Example
