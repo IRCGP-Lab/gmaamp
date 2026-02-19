@@ -1,0 +1,47 @@
+package:
+  name: gmaamp
+  version: "1.0.0"
+
+source:
+  path: src
+
+requirements:
+  build:
+    - make
+  run:
+    - python >=3.10
+    - openpyxl
+    - reportlab
+    - snpeff =5.2
+    - snpsift =5.2
+    - kraken2
+    - bracken
+    - bwa
+    - samtools
+    - bcftools
+    - bedtools
+    - cutadapt
+    - fastqc
+    - seqkit
+    - tb-profiler =6.6.6
+    - multiqc
+
+test:
+  commands:
+    - gmaamp --help
+    - snpEff -version 2>&1 | grep "5.2"
+
+about:
+  home: https://github.com/IRCGP-Lab/gmaamp
+  license: GPL-3.0-or-later
+  license_family: GPL
+  summary: "Automated Ampliseq Analysis Pipeline for TB (MycoChase-Amp)"
+  
+  doc_url: https://link.springer.com/article/10.1186/s12864-024-10320-3
+  
+  description: |
+    GMAAMP is a comprehensive targeted NGS bioinformatics pipeline for analyzing Mycobacterium tuberculosis Ampliseq data.
+    
+    Reference / Citation: 
+    Kim et al. (2024). "GenoMycAnalyzer: a web-based tool for species and drug resistance prediction for Mycobacterium genomes"
+    BMC Genomics, https://link.springer.com/article/10.1186/s12864-024-10320-3

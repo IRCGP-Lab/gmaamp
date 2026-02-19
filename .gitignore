@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Conda Build Artifacts
+build_env/
+*.conda
+*.tar.bz2
+.messages.txt

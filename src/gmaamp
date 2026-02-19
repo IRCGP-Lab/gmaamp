@@ -1,0 +1,1053 @@
+#!/bin/bash
+
+# Detect errors even if they occur in the middle of a pipeline
+set -o pipefail
+
+# --- Dependency Check (Optional Safety) ---
+# Ensure essential tools are available in the current PATH
+if ! command -v snpEff &> /dev/null; then
+    echo "[ERROR] 'snpEff' command not found."
+    echo "        Please activate the conda environment where gmaamp is installed."
+    echo "        Example: conda activate gmaamp_env"
+    exit 1
+fi
+# ------------------------------------------
+
+# ------------------------------------------------------------------------------
+# [CRITICAL FIX] Dynamic Path Detection & Environment Setup
+# ------------------------------------------------------------------------------
+# 1. Get the directory where this script is located (e.g., .../envs/gmaamp/bin)
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
+# 2. Determine Environment Root (e.g., .../envs/gmaamp)
+GMA_ROOT="$( dirname "$SCRIPT_DIR" )"
+
+# 3. Define Share Directory (Where DB and scripts are located)
+GMA_SHARE="${GMA_ROOT}/share/GMA"
+
+# 4. Force add the environment's bin to PATH
+export PATH="${GMA_ROOT}/bin:$PATH"
+
+## Usage ########################################################################################################
+##                                                                                                             ##
+## gmaamp --fastq Fastq_DIR --out Output_DIR --db Kraken2DB --threads 16 ...                                   ##
+##                                                                                                             ##
+#################################################################################################################
+
+# Initialize default values
+consequence="on"
+NEXTSEQ=false
+TARGET_SAMPLE=""   # Default: Empty (Process all files in directory)
+SUMMARY_ONLY=false # Default: Run analysis logic
+Batch=""           # Initialized empty to check user input
+Max=1              # Default Max Jobs (Sequential)
+THREADS=16         # Default Threads
+MIN_LEN=150        # Default Minimum Length for cutadapt
+
+# TB-Profiler Settings
+RUN_TB_PROFILER=false # Default: DO NOT run TB-Profiler
+TB_PROFILE_OPTS=""    # Custom options for 'tb-profiler profile'
+TB_COLLATE_OPTS=""    # Custom options for 'tb-profiler collate'
+MERGE_REPORTS=false   # Default: Do not merge reports
+
+# Filter & Output Options
+MIN_VAF=""
+MAX_WHO_GROUP=""
+USER_COLUMNS=""    
+ALL_COLUMNS=false
+GENERATE_PDF=false
+USER_TMP_DIR=""
+
+# Adapter Sequences (Default: MycoChase-Amp)
+ADAPTER_1="CTGTCTCTTATACACATCT"
+ADAPTER_2="CTGTCTCTTATACACATCT"
+
+# Argument parsing loop
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -i|--input|--fastq) RawDATA="$2"; shift ;;
+        -o|--output|--result) RESULTS="$2"; shift ;;
+        -c|--consequence) consequence="$2"; shift ;;
+        --consequence=*) consequence="${1#*=}" ;; # Handle --consequence=on format
+        -b|--batch) Batch="$2"; shift ;;
+        -d|--db|--kraken-db) KRAKENDB="$2"; shift ;;
+        -j|--jobs) Max="$2"; shift ;;
+        -t|--threads) THREADS="$2"; shift ;;      # Added Threads Option
+        -m|--min-len) MIN_LEN="$2"; shift ;;      # Min Length Option
+        -n|--nextseq) NEXTSEQ=true ;;
+        -s|--sample) TARGET_SAMPLE="$2"; shift ;;  # Targeted sample processing (for Job Arrays)
+        --summary-only) SUMMARY_ONLY=true ;;       # Skip analysis, run aggregation only
+        
+        # TB-Profiler Control
+        --run-tbprofiler) RUN_TB_PROFILER=true ;;  # Enable TB-Profiler steps
+        --tb-profile-opts) TB_PROFILE_OPTS="$2"; shift ;; # Pass-through options for profile
+        --tb-collate-opts) TB_COLLATE_OPTS="$2"; shift ;; # Pass-through options for collate
+        --merge-reports) MERGE_REPORTS=true ;;     # Merge TB-Profiler result into GMA summary
+        
+        # Filter & Output Arguments
+        --min-vaf|--min_vaf) MIN_VAF="$2"; shift ;;
+        --max-who-group|--max_who_group) MAX_WHO_GROUP="$2"; shift ;;
+        --columns) USER_COLUMNS="$2"; shift ;;     # Use USER_COLUMNS to avoid conflict
+        --all-columns|--all_columns) ALL_COLUMNS=true ;; 
+        --pdf) GENERATE_PDF=true ;;
+        --tmp-dir|--tmp_dir) USER_TMP_DIR="$2"; shift ;;
+        
+        # Adapter Options
+        --adapter1) ADAPTER_1="$2"; shift ;;
+        --adapter2) ADAPTER_2="$2"; shift ;;
+        
+        -h|--help) HELP=true ;;
+        *) echo "Unknown parameter passed: $1"; exit 1 ;;
+    esac
+    shift
+done
+
+# Set Default Batch ID based on mode if not provided
+if [ -z "$Batch" ]; then
+    if [ "$SUMMARY_ONLY" = true ]; then
+        Batch="gmaamp_Summary_$(date +%Y%m%d)"
+    else
+        Batch="gmaamp_$(date +%Y%m%d)"
+    fi
+fi
+
+# Validation Logic: -d is optional in summary-only mode
+MISSING_ARGS=false
+
+if [ -z "$RawDATA" ]; then MISSING_ARGS=true; fi
+if [ -z "$RESULTS" ]; then MISSING_ARGS=true; fi
+
+# Check -d only if NOT in summary mode
+if [ "$SUMMARY_ONLY" = false ] && [ -z "$KRAKENDB" ]; then 
+    MISSING_ARGS=true
+fi
+
+if [ "$MISSING_ARGS" = true ] || [ "$HELP" = true ]; then
+    echo ""
+    echo "============================================================"
+    echo "         GenoMycAnalyzer-AMP (gmaamp) : Usage Guide"
+    echo "============================================================"
+    echo ""
+    echo " Usage:"
+    echo ""
+    echo "   gmaamp [OPTIONS]"
+    echo ""
+    echo " Required Options:"
+    echo "   -i, --fastq DIR          : Directory containing *_R1*.gz or *_1.gz files"
+    echo "                              (Supports .fastq.gz, .fq.gz, and lane numbers like _L001_R1_001)"
+    echo "   -o, --out DIR            : Output directory for analysis results"
+    echo "   -d, --db DIR             : Kraken2/Bracken database directory (Required for analysis)"
+    echo ""
+    echo " Mode Selection (Choose one based on your environment):"
+    echo "   1. Standalone/Server (Batch Mode) - Recommended for non-Slurm"
+    echo "      -j, --jobs INT        : Max parallel jobs controlled by this script (Default: 1)"
+    echo "      (e.g., 'gmaamp -j 16' will process 16 samples at a time)"
+    echo ""
+    echo "   2. Slurm/HPC Cluster (Array Mode) - Recommended for Slurm"
+    echo "      -s, --sample STR      : Process ONLY this specific sample (Sample Name)"
+    echo "      (Use with Slurm Job Array: 'sbatch --array=1-100 run.sh')"
+    echo ""
+    echo " Performance Options:"
+    echo "   -t, --threads INT        : Number of threads per sample (Default: 16)"
+    echo "                              Applied to: seqkit, cutadapt, bwa, samtools, bcftools, tb-profiler"
+    echo "   -m, --min-len INT        : Minimum read length for cutadapt (Default: 150)"
+    echo ""
+    echo " TB-Profiler Options:"
+    echo "   --run-tbprofiler         : Enable TB-Profiler analysis (Default: Disabled)"
+    echo "   --tb-profile-opts STR    : Pass custom options to 'tb-profiler profile' (e.g., \"--txt --csv\")"
+    echo "   --tb-collate-opts STR    : Pass custom options to 'tb-profiler collate' (e.g., \"--txt\")"
+    echo "   --merge-reports          : Merge TB-Profiler summary into GMAAMP summary (Requires --run-tbprofiler)"
+    echo "   --tmp-dir DIR            : Custom temporary directory for TB-Profiler (Avoids /tmp space issues)"
+    echo ""
+    echo " Optional Options:"
+    echo "   -b, --batch STR          : Batch name (Default: GenoMycAnalyzer_[Summary_]YYYYMMDD)"
+    echo "   --summary-only           : Skip analysis loop and run aggregation/summary steps only"
+    echo "   --pdf                    : Generate PDF reports (Default: False)"
+    echo "   -c, --consequence VAL    : Merge sequential SNPs (on/off, default: on)"
+    echo "                              Usage: -c on OR --consequence=on (Do NOT use space around = with short flag -c)"
+    echo "   -n, --nextseq            : Use --nextseq-trim=20 instead of -q 20 (for NextSeq data)"
+    echo "   --adapter1 STR           : Adapter sequence for R1 (Default: TruSeq/MycoChase)"
+    echo "   --adapter2 STR           : Adapter sequence for R2 (Default: TruSeq/MycoChase)"
+    echo ""
+    echo " Filtering & Output Options (for Summary):"
+    echo "   --min-vaf FLOAT          : Minimum VAF to include (e.g., 10 for 10%)"
+    echo "   --max-who-group INT      : Maximum WHO Group to include (1-5)"
+    echo "   --columns STR            : Comma-separated list of columns for summary (e.g. 'Sample,DR_Type')"
+    echo "   --all-columns            : Output ALL columns in summary (including detailed QC and mutations)"
+    echo ""
+    echo "   -h, --help               : Show this help message"
+    echo ""
+    echo "============================================================"
+    echo ""
+
+    if [ "$HELP" = true ]; then
+        exit 0
+    else
+        exit 1
+    fi
+fi
+
+################################################################################
+##  set path
+################################################################################
+REFER="${GMA_SHARE}/MTB_H37Rv/NC_000962.3.fasta"
+SIREF="${GMA_SHARE}/SpikeIn/Spike_In.fa"
+MAX_JOBS=${Max}
+ERROR_LOG="${RESULTS}/processing_failures.log"
+
+################################################################################
+##  Helper Function: Resolve Sample Info from Filename
+################################################################################
+resolve_file_info() {
+    local r1_path="$1"
+    local filename=$(basename "$r1_path")
+    local dir=$(dirname "$r1_path")
+    
+    local sample_name=""
+    local r2_path=""
+    
+    # Pattern 1: Illumina Standard (_R1_001.fastq.gz, .fq.gz)
+    if [[ "$filename" =~ ^(.*)_R1(_[0-9]+)?\.(fastq|fq)\.gz$ ]]; then
+        sample_name="${BASH_REMATCH[1]}"
+        local suffix="${BASH_REMATCH[2]}"
+        local ext="${BASH_REMATCH[3]}"
+        r2_path="${dir}/${sample_name}_R2${suffix}.${ext}.gz"
+        
+    # Pattern 2: Simple Pair (_1.fastq.gz, .fq.gz)
+    elif [[ "$filename" =~ ^(.*)_1\.(fastq|fq)\.gz$ ]]; then
+        sample_name="${BASH_REMATCH[1]}"
+        local ext="${BASH_REMATCH[2]}"
+        r2_path="${dir}/${sample_name}_2.${ext}.gz"
+        
+    else
+        # Fallback: Assume simple _R1 split if regex fails (robustness)
+        sample_name=$(echo "$filename" | sed 's/_R1.*//' | sed 's/_1\..*//')
+        # Try constructing R2 by simple substitution
+        r2_path=$(echo "$r1_path" | sed 's/_R1/_R2/' | sed 's/_1\./_2\./')
+    fi
+    
+    echo "${sample_name}|${r2_path}"
+}
+
+################################################################################
+##  Define FILE_LIST based on mode (supports diverse extensions)
+################################################################################
+if [ -n "$TARGET_SAMPLE" ]; then
+    # Single sample mode: Find the file corresponding to the target sample name
+    FOUND_R1=$(find "$RawDATA" -maxdepth 1 \( -name "${TARGET_SAMPLE}*_R1*.gz" -o -name "${TARGET_SAMPLE}*_1.fastq.gz" -o -name "${TARGET_SAMPLE}*_1.fq.gz" \) | head -n 1)
+    
+    if [ -z "$FOUND_R1" ]; then
+        echo "[ERROR] Targeted sample file not found for: ${TARGET_SAMPLE}"
+        echo "        Checked patterns: *_R1*.gz, *_1.fastq.gz, *_1.fq.gz in $RawDATA"
+        exit 1
+    fi
+    FILE_LIST=("${FOUND_R1}")
+    echo ">>> Mode: Single Sample (${TARGET_SAMPLE})"
+else
+    # Batch mode: Find all R1 candidates
+    shopt -s nullglob
+    FILE_LIST=("${RawDATA}"/*_R1*.fastq.gz "${RawDATA}"/*_R1*.fq.gz "${RawDATA}"/*_1.fastq.gz "${RawDATA}"/*_1.fq.gz)
+    shopt -u nullglob
+    
+    if [ ${#FILE_LIST[@]} -eq 0 ]; then
+        echo "[ERROR] No input files found in $RawDATA"
+        echo "        Looking for *_R1*.fastq.gz, *.fq.gz, or *_1.fastq.gz"
+        exit 1
+    fi
+    echo ">>> Mode: Batch Processing (${#FILE_LIST[@]} files)"
+fi
+
+##############################################################################
+## make output directory
+##############################################################################
+for p in 1_fastq_validate 2_Filtered_Fastq 3_fastqc 4_Aligned_Bams 5_QC 6_Variant_Call 7_spoligotyping 8_Kraken2 9_TBProfiler 10_MultiQC
+do
+  mkdir -p "${RESULTS}/${p}"
+done
+
+touch "${ERROR_LOG}"
+
+################################################################################
+## [Auto-Setup] SpoTyping (Python 2.7) Separate Environment Auto-Setup Logic
+################################################################################
+SPOTYPING_ENV_NAME="GMA_spo"
+
+run_spotyping() {
+    eval "$(conda shell.bash hook)"
+    conda activate "$SPOTYPING_ENV_NAME"
+    SpoTyping.py "$@"
+    conda deactivate
+}
+
+if [ "$SUMMARY_ONLY" = false ]; then
+    ENV_EXISTS=false
+    if conda info --envs | grep -q "${SPOTYPING_ENV_NAME}$"; then
+        if [ -d "${GMA_ROOT}/../${SPOTYPING_ENV_NAME}" ]; then
+             ENV_EXISTS=true
+        fi
+    fi
+
+    if [ "$ENV_EXISTS" = false ]; then
+        if [ -n "$SLURM_JOB_ID" ]; then
+            IS_PARALLEL=true
+        else
+            IS_PARALLEL=false
+        fi
+
+        if [ "$IS_PARALLEL" = true ]; then
+            LOCK_DIR="${GMA_ROOT}/../${SPOTYPING_ENV_NAME}_install_lock"
+            if mkdir "$LOCK_DIR" 2>/dev/null; then
+                echo "----------------------------------------------------------"
+                echo "[System] Installing auxiliary env ($SPOTYPING_ENV_NAME)... (Locked)"
+                echo "----------------------------------------------------------"
+                conda create -n "$SPOTYPING_ENV_NAME" -c bioconda spotyping blast python=2.7 -y
+                rmdir "$LOCK_DIR"
+            else
+                echo "----------------------------------------------------------"
+                echo "[System] Waiting for another job to install $SPOTYPING_ENV_NAME..."
+                echo "----------------------------------------------------------"
+                MAX_RETRIES=60
+                count=0
+                while [ $count -lt $MAX_RETRIES ]; do
+                    if conda info --envs | grep -q "${SPOTYPING_ENV_NAME}$"; then
+                        echo "[System] Environment detected. Proceeding."
+                        break
+                    fi
+                    sleep 10
+                    count=$((count + 1))
+                done
+            fi
+        else
+            echo "----------------------------------------------------------"
+            echo "[System] Installing auxiliary env ($SPOTYPING_ENV_NAME)..."
+            echo "----------------------------------------------------------"
+            conda create -n "$SPOTYPING_ENV_NAME" -c bioconda spotyping blast python=2.7 -y
+        fi
+        
+        if [ $? -eq 0 ]; then
+            echo "[Success] Auxiliary environment ready."
+        else
+            echo "[Error] Failed to setup SpoTyping environment."
+        fi
+    fi
+fi
+
+################################################################################
+## per-sample processing function
+################################################################################
+process_sample() {
+  local r1_file="$1"
+
+  local info_str=$(resolve_file_info "$r1_file")
+  local sample=$(echo "$info_str" | cut -d'|' -f1)
+  local r2_file=$(echo "$info_str" | cut -d'|' -f2)
+
+  if [ ! -f "$r2_file" ]; then
+      echo "[ERROR] Paired read file not found for ${sample}" | tee -a "${ERROR_LOG}"
+      echo "        Expected: $r2_file" | tee -a "${ERROR_LOG}"
+      return 1
+  fi
+
+  echo ">>> Processing sample: ${sample}"
+  echo "    R1: $(basename "$r1_file")"
+  echo "    R2: $(basename "$r2_file")"
+
+  ##############################################################################
+  # Integrity & Validation Check (R1 & R2)
+  ##############################################################################
+  if [ -f "${RESULTS}/1_fastq_validate/${sample}_R1.log" ] && \
+     [ -f "${RESULTS}/1_fastq_validate/${sample}_R2.log" ]; then
+      echo ">>> fastq validate already done for ${sample}. Skipping."
+  else
+      echo "$(date) ============== fastq validate Start: ${sample}"
+      for read_type in "R1" "R2"; do
+          input_file="$r1_file"
+          if [ "$read_type" == "R2" ]; then input_file="$r2_file"; fi
+          
+          log_file="${RESULTS}/1_fastq_validate/${sample}_${read_type}.log"
+          if ! gzip -t "$input_file" >/dev/null 2>&1; then
+              echo "[ERROR] gzip integrity check failed for ${read_type}. Skipping sample: ${sample}" | tee -a "${ERROR_LOG}"
+              return 1
+          fi
+
+          local seqkit_out
+          seqkit_out=$(seqkit stats -j "${THREADS}" "$input_file" 2>&1)
+          local seqkit_rc=$?
+          echo "$seqkit_out" > "$log_file"
+          if [ $seqkit_rc -ne 0 ]; then
+              echo "[ERROR] SeqKit format check failed for ${sample} (${read_type}). See $log_file" | tee -a "${ERROR_LOG}"
+              return 1
+          fi
+      done
+  fi
+
+  ##############################################################################
+  # trimming (cutadapt)
+  ##############################################################################
+  if [ -f "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R1.fastq.gz" ] && \
+     [ -f "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R2.fastq.gz" ]; then
+      echo ">>> trimming already done for ${sample}. Skipping."
+  else
+      if [ "$NEXTSEQ" = true ]; then
+          TRIM_OPT="--nextseq-trim=20"
+      else
+          TRIM_OPT="-q 20"
+      fi
+
+      echo "$(date) ============== trimming Start: ${sample} (Option: ${TRIM_OPT}, MinLen: ${MIN_LEN})"
+      cutadapt \
+          -a "${ADAPTER_1}" \
+          -A "${ADAPTER_2}" \
+          $TRIM_OPT -m "${MIN_LEN}" -j "${THREADS}" \
+          --json="${RESULTS}/2_Filtered_Fastq/${sample}.cutadapt.json" \
+          -o "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R1.fastq.gz" \
+          -p "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R2.fastq.gz" \
+          "$r1_file" "$r2_file"
+      
+      if [ $? -ne 0 ]; then
+          echo "[ERROR] Trimming failed for ${sample}. Cleaning up partial files." | tee -a "${ERROR_LOG}"
+          rm -f "${RESULTS}/2_Filtered_Fastq/${sample}"*
+          return 1
+      fi
+      rm -f "${RESULTS}/2_Filtered_Fastq/${sample}.cutadapt.json"
+  fi
+
+  ##############################################################################
+  # Data QC (FastQC)
+  ##############################################################################
+  if [ -d "${RESULTS}/3_fastqc/${sample}_Filtered_R2_fastqc" ]; then
+      echo ">>> FastQC already done for ${sample}. Skipping."
+  else
+      echo "$(date) ============== fastqc Start: ${sample}"
+      fastqc --extract -o "${RESULTS}/3_fastqc" "$r1_file" && \
+      fastqc --extract -o "${RESULTS}/3_fastqc" "$r2_file" && \
+      fastqc --extract -o "${RESULTS}/3_fastqc" "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R1.fastq.gz" && \
+      fastqc --extract -o "${RESULTS}/3_fastqc" "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R2.fastq.gz"
+      
+      if [ $? -ne 0 ]; then
+          echo "[WARNING] FastQC encountered an issue for ${sample}, but proceeding."
+      fi
+
+      for read_type in "R1" "R2"; do
+          qc_data="${RESULTS}/3_fastqc/${sample}_${read_type}_fastqc/fastqc_data.txt"
+          if [ -f "$qc_data" ]; then
+              awk '
+                  BEGIN { in_mod=0 }
+                  /^>>Per base sequence content/ { in_mod=1; next }
+                  /^>>END_MODULE/ { in_mod=0 }
+                  in_mod && $1 != "#Base" && $2 > 60 { exit 10 }
+              ' "$qc_data"
+              
+              if [ $? -eq 10 ]; then
+                  echo "[WARNING] Potential NextSeq Poly-G detected in ${sample} ${read_type}. Consider --nextseq." | tee -a "${ERROR_LOG}"
+              fi
+          fi
+      done
+  fi
+
+  ##############################################################################
+  # Spike-In quality control
+  ##############################################################################
+  if [ -f "${RESULTS}/5_QC/${sample}_SpikeIn3.depth" ]; then
+      echo ">>> Spike-In Mapping already done for ${sample}. Skipping."
+  else
+      echo "$(date) ============== Spike-In Mapping Start: ${sample}"
+      bwa mem \
+          -M -R "@RG\tID:MycoChase\tLB:MycoChaseAmp\tSM:${sample}\tPL:MiSeq\tPI:600" \
+          -t "${THREADS}" "${SIREF}" \
+          "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R1.fastq.gz" \
+          "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R2.fastq.gz" \
+          > "${RESULTS}/4_Aligned_Bams/${sample}_SI.sam"
+      
+      if [ $? -ne 0 ]; then
+          echo "[ERROR] BWA Spike-In Mapping failed for ${sample}" | tee -a "${ERROR_LOG}"
+          rm -f "${RESULTS}/4_Aligned_Bams/${sample}_SI.sam"
+          return 1
+      fi
+
+      samtools view -u -@ "${THREADS}" "${RESULTS}/4_Aligned_Bams/${sample}_SI.sam" \
+      | samtools sort -@ "${THREADS}" -o "${RESULTS}/4_Aligned_Bams/${sample}_SI_sorted.bam"
+
+      if [ $? -ne 0 ]; then
+          echo "[ERROR] Samtools processing failed for ${sample}" | tee -a "${ERROR_LOG}"
+          return 1
+      fi
+
+      if ! samtools depth -aa \
+          -b "${GMA_SHARE}/SpikeIn.bed" \
+          -H -o "${RESULTS}/5_QC/${sample}_SpikeIn.depth" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_SI_sorted.bam"; then
+          echo "[ERROR] Samtools depth failed for ${sample}" | tee -a "${ERROR_LOG}"
+          return 1
+      fi
+
+      awk '{if($1=="spikein_1") {c++; s+=$3}} END {if(c>0) print s/c; else print 0}' "${RESULTS}/5_QC/${sample}_SpikeIn.depth" > "${RESULTS}/5_QC/${sample}_SpikeIn1.depth"
+      awk '{if($1=="spikein_2") {c++; s+=$3}} END {if(c>0) print s/c; else print 0}' "${RESULTS}/5_QC/${sample}_SpikeIn.depth" > "${RESULTS}/5_QC/${sample}_SpikeIn2.depth"
+      awk '{if($1=="spikein_3") {c++; s+=$3}} END {if(c>0) print s/c; else print 0}' "${RESULTS}/5_QC/${sample}_SpikeIn.depth" > "${RESULTS}/5_QC/${sample}_SpikeIn3.depth"
+
+      rm -f "${RESULTS}/4_Aligned_Bams/${sample}_SI.sam" \
+            "${RESULTS}/4_Aligned_Bams/${sample}_SI_sorted.bam"
+  fi
+
+  ##############################################################################
+  # Kraken2 + Bracken
+  ##############################################################################
+  if [ -f "${RESULTS}/8_Kraken2/${sample}.S.braken" ]; then
+      echo ">>> Kraken2+Bracken already done for ${sample}. Skipping."
+  else
+      echo "$(date) ============== kraken2 Start: ${sample}"
+
+      kraken2 \
+          --db "${KRAKENDB}" \
+          --paired --threads "${THREADS}" \
+          --minimum-base-quality 1 \
+          --minimum-hit-groups 3 \
+          --report-minimizer-data \
+          --report "${RESULTS}/8_Kraken2/${sample}.kreport" \
+          --output "${RESULTS}/8_Kraken2/${sample}.kraken" \
+          --use-names \
+          "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R1.fastq.gz" \
+          "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R2.fastq.gz"
+
+      if [ $? -ne 0 ]; then
+          echo "[WARNING] Kraken2 failed for ${sample}. Skipping Bracken." | tee -a "${ERROR_LOG}"
+      else
+          # Run Bracken only if Kraken2 succeeded
+          bracken \
+              -d "${KRAKENDB}" \
+              -i "${RESULTS}/8_Kraken2/${sample}.kreport" \
+              -o "${RESULTS}/8_Kraken2/${sample}.S.braken" \
+              -r 100 -l 'S' -t 0 && \
+          bracken \
+              -d "${KRAKENDB}" \
+              -i "${RESULTS}/8_Kraken2/${sample}.kreport" \
+              -o "${RESULTS}/8_Kraken2/${sample}.S1.braken" \
+              -r 100 -l 'S1' -t 0
+
+          if [ $? -ne 0 ]; then
+              echo "[WARNING] Bracken failed for ${sample}." | tee -a "${ERROR_LOG}"
+          else
+              echo "Bracken passed for ${sample}."
+              rm -f "${RESULTS}/8_Kraken2/${sample}.kraken" \
+                    "${RESULTS}/8_Kraken2/${sample}.kreport" \
+                    "${RESULTS}/8_Kraken2/${sample}_bracken_species.kreport"
+          fi
+      fi
+  fi
+
+  ##############################################################################
+  # MTBC fraction cutoff (always check)
+  ##############################################################################
+  BRACKEN_FILE="${RESULTS}/8_Kraken2/${sample}.S.braken"
+  MTBC_CUTOFF=0.1
+
+  if [ -f "$BRACKEN_FILE" ]; then
+      if awk -F'\t' -v c="$MTBC_CUTOFF" '
+      NR == 1 {next}
+      $1 == "Mycobacterium tuberculosis"  ||
+      $1 == "Mycobacterium africanum"     ||
+      $1 == "Mycobacterium bovis"         ||
+      $1 == "Mycobacterium canettii"      ||
+      $1 == "Mycobacterium caprae"        ||
+      $1 == "Mycobacterium microti"       ||
+      $1 == "Mycobacterium orygis"        ||
+      $1 == "Mycobacterium pinnipedii"    ||
+      $1 == "Mycobacterium mungi"         ||
+      $1 == "Mycobacterium suricattae"    ||
+      $1 == "Mycobacterium dassie"        {
+          sum += $NF
+      }
+      END {
+          if (sum == "") sum = 0;
+          printf ">>> MTBC total fraction = %.6f (cutoff = %.3f)\n", sum, c;
+          if (sum >= c) exit 0; else exit 1;
+      }' "$BRACKEN_FILE"; then
+          echo ">>> MTBC fraction >= cutoff. Proceeding."
+      else
+          echo ">>> MTBC fraction < cutoff. Skipping sample: ${sample}"
+          return 0
+      fi
+  else
+      echo "[WARNING] Bracken result not found. Skipping MTBC check."
+  fi
+
+  ##############################################################################
+  # Reads mapping (BWA + Samtools)
+  ##############################################################################
+  if [ -f "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" ] && \
+     [ -f "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam.bai" ]; then
+      echo ">>> Mapping already done for ${sample}. Skipping."
+  else
+      echo "$(date) ============== Reference Mapping Start: ${sample}"
+
+      bwa mem \
+          -M -R "@RG\tID:MycoChase\tLB:MycoChase_Amp\tSM:${sample}\tPL:MiSeq\tPI:600" \
+          -t "${THREADS}" "${REFER}" \
+          "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R1.fastq.gz" \
+          "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R2.fastq.gz" \
+          > "${RESULTS}/4_Aligned_Bams/${sample}.sam"
+      
+      if [ $? -ne 0 ]; then
+          echo "[ERROR] BWA Mapping failed for ${sample}" | tee -a "${ERROR_LOG}"
+          rm -f "${RESULTS}/4_Aligned_Bams/${sample}.sam"
+          return 1
+      fi
+
+      {
+          samtools view \
+              -@ "${THREADS}" \
+              -b "${RESULTS}/4_Aligned_Bams/${sample}.sam" \
+              > "${RESULTS}/4_Aligned_Bams/${sample}.bam" && \
+
+          samtools sort \
+              -@ "${THREADS}" -n "${RESULTS}/4_Aligned_Bams/${sample}.bam" \
+              -o "${RESULTS}/4_Aligned_Bams/${sample}_sorted.bam" && \
+
+          samtools fixmate \
+              -@ "${THREADS}" -m "${RESULTS}/4_Aligned_Bams/${sample}_sorted.bam" \
+              "${RESULTS}/4_Aligned_Bams/${sample}_fixed.bam" && \
+
+          samtools sort \
+              -@ "${THREADS}" "${RESULTS}/4_Aligned_Bams/${sample}_fixed.bam" \
+              > "${RESULTS}/4_Aligned_Bams/${sample}_fixed_sorted.bam" && \
+
+          cp "${RESULTS}/4_Aligned_Bams/${sample}_fixed_sorted.bam" \
+             "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" && \
+
+          samtools index \
+              "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam"
+      }
+
+      if [ $? -ne 0 ]; then
+          echo "[ERROR] Samtools processing failed for ${sample}" | tee -a "${ERROR_LOG}"
+          return 1
+      fi
+
+      rm -f "${RESULTS}/4_Aligned_Bams/${sample}.sam" \
+            "${RESULTS}/4_Aligned_Bams/${sample}.bam" \
+            "${RESULTS}/4_Aligned_Bams/${sample}_sorted.bam" \
+            "${RESULTS}/4_Aligned_Bams/${sample}_fixed.bam" \
+            "${RESULTS}/4_Aligned_Bams/${sample}_fixed_sorted.bam"
+  fi
+
+  ##############################################################################
+  # Reads mapping QC
+  ##############################################################################
+  if [ -f "${RESULTS}/5_QC/${sample}.depth.average" ]; then
+      echo ">>> Mapping QC already done for ${sample}. Skipping."
+  else
+      echo "$(date) ============== Read mapping QC Start: ${sample}"
+
+      if ! samtools stats -@ "${THREADS}" \
+          -r "${REFER}" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" \
+          > "${RESULTS}/5_QC/${sample}_dup_removed.whole.stats"; then
+          echo "[ERROR] Samtools whole stats failed for ${sample}" | tee -a "${ERROR_LOG}"
+          return 1
+      fi
+
+      if ! samtools stats -@ "${THREADS}" \
+          -r "${REFER}" \
+          -t "${GMA_SHARE}/MycoChase_Amp_v1.bed" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" \
+          > "${RESULTS}/5_QC/${sample}_dup_removed.target.stats"; then
+          echo "[ERROR] Samtools target stats failed for ${sample}" | tee -a "${ERROR_LOG}"
+          return 1
+      fi
+
+      if ! samtools depth -aa \
+          -b "${GMA_SHARE}/MycoChase_Amp_v1.bed" \
+          -H -o "${RESULTS}/5_QC/${sample}_dup_removed.depth" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam"; then
+          echo "[ERROR] Samtools depth failed for ${sample}" | tee -a "${ERROR_LOG}"
+          return 1
+      fi
+
+      awk '{
+          sum += $3;
+          if ($3 >= 1) cov1++;
+          if ($3 >= 50) cov50++;
+          if ($3 >= 100) cov100++;
+      } 
+      END {
+          if (NR > 0) {
+              print sum / NR > "'"${RESULTS}/5_QC/${sample}.depth.average"'"
+              print (cov1 / NR) * 100 > "'"${RESULTS}/5_QC/${sample}.depth.001X"'"
+              print (cov50 / NR) * 100 > "'"${RESULTS}/5_QC/${sample}.depth.050X"'"
+              print (cov100 / NR) * 100 > "'"${RESULTS}/5_QC/${sample}.depth.100X"'"
+          } else {
+              print 0 > "'"${RESULTS}/5_QC/${sample}.depth.average"'"
+              print 0 > "'"${RESULTS}/5_QC/${sample}.depth.001X"'"
+              print 0 > "'"${RESULTS}/5_QC/${sample}.depth.050X"'"
+              print 0 > "'"${RESULTS}/5_QC/${sample}.depth.100X"'"
+          }
+      }' "${RESULTS}/5_QC/${sample}_dup_removed.depth"
+
+      samtools view "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" \
+          | awk '{sum+=$5} END { if (NR>0) print sum/NR; else print 0 }' > "${RESULTS}/5_QC/${sample}.MAPQ"
+
+  fi
+
+  ##############################################################################
+  # Variant calling (bcftools
+  ##############################################################################
+  if [ -f "${RESULTS}/6_Variant_Call/${sample}_filtered.vcf" ]; then
+      echo ">>> Variant calling already done for ${sample}. Skipping."
+  else
+      echo "$(date) ============== Variant calling Start: ${sample}"
+
+      bcftools mpileup -B -d 100000 -L 100000 -Ou --threads "${THREADS}" \
+          -f "${REFER}" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" \
+        | bcftools call -Ov --ploidy 1 --threads "${THREADS}" -v -c \
+          -o "${RESULTS}/6_Variant_Call/${sample}.vcf"
+      
+      if [ $? -ne 0 ]; then echo "[ERROR] Variant Calling(1) failed" | tee -a "${ERROR_LOG}"; return 1; fi
+
+      bcftools view -e 'QUAL <= 30 || DP <= 50 || (DP4[2]+DP4[3])/(DP4[0]+DP4[1]+DP4[2]+DP4[3]) < 0.75 || (DP4[2]+DP4[3]) < 4' \
+          "${RESULTS}/6_Variant_Call/${sample}.vcf" \
+          > "${RESULTS}/6_Variant_Call/${sample}_filtered_1.vcf"
+          
+      if [ "$consequence" = "on" ]; then
+          echo ">>> Running consequence (MNV merging) on High-Conf VCF for ${sample}..."
+          python "${GMA_SHARE}/merge_vcf_Array_v1.2.py" \
+              "${RESULTS}/6_Variant_Call" \
+              "${RESULTS}/6_Variant_Call" \
+              "${sample}" \
+              "_filtered_1.vcf" \
+              "_filtered_1_sum.vcf"
+              
+          if [ ! -f "${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf" ]; then
+               cp "${RESULTS}/6_Variant_Call/${sample}_filtered_1.vcf" "${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf"
+          fi
+      else
+          cp "${RESULTS}/6_Variant_Call/${sample}_filtered_1.vcf" "${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf"
+      fi
+
+      bcftools mpileup -B -d 100000 -L 100000 -Ou --threads "${THREADS}" \
+          -f "${REFER}" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" \
+        | bcftools call -Ov --ploidy 1 --threads "${THREADS}" -A -c \
+          -o "${RESULTS}/6_Variant_Call/${sample}_A.vcf"
+
+      if [ $? -ne 0 ]; then echo "[ERROR] Variant Calling(2) failed" | tee -a "${ERROR_LOG}"; return 1; fi
+
+      bcftools view -e '(DP4[2]+DP4[3]) < 4' "${RESULTS}/6_Variant_Call/${sample}_A.vcf" \
+          > "${RESULTS}/6_Variant_Call/${sample}_N_ALT.vcf"
+
+      bedtools intersect -header -a "${RESULTS}/6_Variant_Call/${sample}_N_ALT.vcf" \
+          -b "${GMA_SHARE}/WHODR_v2.bed" \
+          > "${RESULTS}/6_Variant_Call/${sample}_1~3.vcf"
+
+      HIGH_CONF_VCF="${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf"
+      LOW_CONF_VCF="${RESULTS}/6_Variant_Call/${sample}_1~3.vcf"
+      CLEANED_LOW_CONF="${RESULTS}/6_Variant_Call/${sample}_1~3_cleaned.vcf"
+
+      if [ -s "${LOW_CONF_VCF}" ]; then
+          echo ">>> Removing Low-Conf variants overlapping with High-Conf variants..."
+          bedtools intersect -v \
+              -a "${LOW_CONF_VCF}" \
+              -b "${HIGH_CONF_VCF}" \
+              > "${CLEANED_LOW_CONF}"
+      else
+          echo ">>> No Low-Conf variants found (or file empty). Skipping overlap removal."
+          touch "${CLEANED_LOW_CONF}"
+      fi
+      
+      HEADER_FILE="${RESULTS}/6_Variant_Call/${sample}.header.tmp"
+      if [ -s "${HIGH_CONF_VCF}" ]; then
+          grep '^#' "${HIGH_CONF_VCF}" > "$HEADER_FILE"
+      elif [ -s "${RESULTS}/6_Variant_Call/${sample}.vcf" ]; then
+          grep '^#' "${RESULTS}/6_Variant_Call/${sample}.vcf" > "$HEADER_FILE"
+      fi
+
+      BODY_FILE="${RESULTS}/6_Variant_Call/${sample}.body.tmp"
+      {
+        if [ -s "${HIGH_CONF_VCF}" ]; then
+            grep -v '^#' "${HIGH_CONF_VCF}"
+        fi
+        if [ -s "${CLEANED_LOW_CONF}" ]; then
+            grep -v '^#' "${CLEANED_LOW_CONF}"
+        fi
+      } | sort -k2,2n -u > "$BODY_FILE"
+
+      cat "$HEADER_FILE" "$BODY_FILE" > "${RESULTS}/6_Variant_Call/${sample}_sorted_merge.vcf"
+      
+      rm -f "$HEADER_FILE" "$BODY_FILE" "$CLEANED_LOW_CONF"
+
+      bcftools view -e 'DP <= 50 || (DP4[2]+DP4[3])/(DP4[0]+DP4[1]+DP4[2]+DP4[3]) < 0.03 || (DP4[2]+DP4[3]) < 4' \
+          "${RESULTS}/6_Variant_Call/${sample}_sorted_merge.vcf" \
+          > "${RESULTS}/6_Variant_Call/${sample}_filtered.vcf"
+  fi
+
+  ##############################################################################
+  # Spoligotyping
+  ##############################################################################
+  if [ ! -f "${RESULTS}/7_spoligotyping/${sample}.spologityping.out" ]; then
+      echo "$(date) ============== Spoligotyping Start: ${sample}"
+      
+      LOCAL_SPO_DIR="/tmp/gma_spo_${sample}_$$"
+      mkdir -p "$LOCAL_SPO_DIR"
+      
+      echo " -> Using local scratch: $LOCAL_SPO_DIR"
+      
+      run_spotyping \
+          --sorted -o "${sample}.spologityping.out" -O "$LOCAL_SPO_DIR" \
+          "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R1.fastq.gz" \
+          "${RESULTS}/2_Filtered_Fastq/${sample}_Filtered_R2.fastq.gz"
+      
+      RET_VAL=$?
+      
+      if [ -f "$LOCAL_SPO_DIR/${sample}.spologityping.out" ]; then
+          mv "$LOCAL_SPO_DIR/${sample}.spologityping.out" "${RESULTS}/7_spoligotyping/"
+      fi
+      
+      rm -rf "$LOCAL_SPO_DIR"
+
+      if [ $RET_VAL -ne 0 ]; then 
+          echo "[ERROR] Spoligotyping failed" | tee -a "${ERROR_LOG}"
+      fi
+  fi
+
+  ##############################################################################
+  # Lineage calling
+  ##############################################################################
+  if [ ! -f "${RESULTS}/7_spoligotyping/${sample}.lineage.txt" ]; then
+      echo "$(date) ============== Lineage calling Start: ${sample}"
+      
+      python "${GMA_SHARE}/lineage_call_v1.3.py" \
+          "${RESULTS}/6_Variant_Call/${sample}.vcf" \
+          "${RESULTS}/5_QC/${sample}_dup_removed.depth" \
+          "${RESULTS}/7_spoligotyping/${sample}.lineage.txt"
+      if [ $? -ne 0 ]; then echo "[ERROR] Lineage calling failed" | tee -a "${ERROR_LOG}"; fi
+  fi
+
+  echo ">>> Lineage result for ${sample}:"
+  if [ -f "${RESULTS}/7_spoligotyping/${sample}.lineage.txt" ]; then
+      tail -n 1 "${RESULTS}/7_spoligotyping/${sample}.lineage.txt"
+  fi
+
+  ##############################################################################
+  # TB-Profiler
+  ##############################################################################
+  if [ "$RUN_TB_PROFILER" = true ]; then
+      if [ ! -f "${RESULTS}/9_TBProfiler/vcf/${sample}.targets.vcf.gz" ]; then
+          echo "$(date) ============== TB-Profiler Start: ${sample}"
+          
+          TB_CMD="tb-profiler profile -1 \"$r1_file\" -2 \"$r2_file\" -p \"${sample}\" -d \"${RESULTS}/9_TBProfiler\" -t \"${THREADS}\" --spoligotype ${TB_PROFILE_OPTS}"
+
+          if [ -n "$USER_TMP_DIR" ]; then
+              mkdir -p "$USER_TMP_DIR"
+              SAMPLE_TMP="$USER_TMP_DIR/tmp_${sample}"
+              mkdir -p "$SAMPLE_TMP"
+              export TMPDIR="$SAMPLE_TMP"
+              
+              TB_CMD="$TB_CMD --temp \"$SAMPLE_TMP\""
+              
+              eval $TB_CMD
+              RET_VAL=$?
+              
+              rm -rf "$SAMPLE_TMP"
+          else
+              eval $TB_CMD
+              RET_VAL=$?
+          fi
+          
+          if [ $RET_VAL -ne 0 ]; then 
+              echo "[ERROR] TB-Profiler failed" | tee -a "${ERROR_LOG}"
+              return 1
+          fi
+      fi
+  else
+      # echo ">>> TB-Profiler skipped (Default). Use --run-tbprofiler to enable."
+      :
+  fi
+
+  ##############################################################################
+  # Target Gene Depth Calculation (Large Deletion)
+  ##############################################################################
+  if [ ! -f "${RESULTS}/6_Variant_Call/${sample}_tlyA.depth" ]; then
+      echo "$(date) ============== Large Deletion Check Start: ${sample}"
+      
+      samtools depth -a \
+          -r "NC_000962.3:2148889-2161111" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" > "${RESULTS}/6_Variant_Call/${sample}_katG.depth"
+          
+      samtools depth -a \
+          -r "NC_000962.3:2283681-2294253" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" > "${RESULTS}/6_Variant_Call/${sample}_pncA.depth"
+          
+      samtools depth -a \
+          -r "NC_000962.3:4402528-4413202" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" > "${RESULTS}/6_Variant_Call/${sample}_gid.depth"
+          
+      samtools depth -a \
+          -r "NC_000962.3:4321004-4332483" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" > "${RESULTS}/6_Variant_Call/${sample}_ethA.depth"
+
+      samtools depth -a \
+          -r "NC_000962.3:1912940-1923746" \
+          "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" > "${RESULTS}/6_Variant_Call/${sample}_tlyA.depth"
+  fi
+}
+
+################################################################################
+## Main Loop (Targeted or Batch)
+################################################################################
+if [ "$SUMMARY_ONLY" = false ]; then
+    
+    echo ">>> Starting Analysis Loop..."
+    running_jobs=0
+
+    for sfile in "${FILE_LIST[@]}"; do
+      [ -e "$sfile" ] || continue
+      
+      process_sample "$sfile" &
+      
+      running_jobs=$((running_jobs + 1))
+
+      if [ "$running_jobs" -ge "$MAX_JOBS" ]; then
+          wait -n
+          running_jobs=$((running_jobs - 1))
+      fi
+    done
+    wait
+    echo ">>> Analysis Loop Finished."
+
+else
+    echo ">>> Skipping Analysis Loop (--summary-only specified). Proceeding to aggregation."
+fi
+
+##############################################################################
+## Post-processing Logic
+##############################################################################
+if [ -n "$TARGET_SAMPLE" ]; then
+    echo ">>> Single sample mode finished. Skipping batch aggregation."
+    echo ">>> snpEff per sample..."
+
+    if [ -f "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}.ann.tsv" ]; then
+        echo ">>> snpEff already done for ${TARGET_SAMPLE}. Skipping."
+    else
+        vcf_file="${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_filtered.vcf"
+        
+        if [ -f "$vcf_file" ]; then
+            snpEff H37Rv "$vcf_file" \
+                -v -noLof -noStats -ud 1000 -no-downstream -no-utr \
+                > "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}.ann.vcf"
+
+            SnpSift extractFields \
+                -s "," -e "." \
+                "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}.ann.vcf" \
+                POS REF ALT DP "ANN[*].EFFECT" "ANN[*].GENE" "ANN[*].GENEID" "ANN[*].HGVS_C" "ANN[*].HGVS_P" DP4 \
+                > "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}.ann.tsv"
+        fi
+    fi
+
+    rm -f "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}.vcf" \
+          "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_1~3.vcf" \
+          "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_A.vcf" \
+          "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_filtered_1.vcf" \
+          "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_filtered_1_sum.vcf" \
+          "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_merge.vcf" \
+          "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_N_ALT.vcf" \
+          "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_sorted_merge.vcf" \
+          "${RESULTS}/7_spoligotyping/"*tmp* "${RESULTS}/7_spoligotyping/"*.xls
+    
+    echo ">>> Done."
+    exit 0
+fi
+
+##############################################################################
+# Below runs ONLY if processing Batch Mode OR Summary Mode
+##############################################################################
+echo ">>> Starting Aggregation / Summary Phase..."
+
+MAKE_VAR_OPTS=""
+if [ -n "$MIN_VAF" ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --min_vaf $MIN_VAF"; fi
+if [ -n "$MAX_WHO_GROUP" ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --max_who_group $MAX_WHO_GROUP"; fi
+if [ -n "$USER_COLUMNS" ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --columns $USER_COLUMNS"; fi
+if [ "$ALL_COLUMNS" = true ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --all_columns"; fi
+if [ "$GENERATE_PDF" = true ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --pdf"; fi
+
+snpeff_sample() {
+  local sample="$1"
+  if [ -f "${RESULTS}/6_Variant_Call/${sample}.ann.tsv" ]; then return 0; fi
+
+  vcf_file="${RESULTS}/6_Variant_Call/${sample}_filtered.vcf"
+
+  if [ ! -f "$vcf_file" ]; then return 0; fi
+
+  snpEff H37Rv "$vcf_file" \
+      -v -noLof -noStats -ud 1000 -no-downstream -no-utr \
+      > "${RESULTS}/6_Variant_Call/${sample}.ann.vcf"
+
+  SnpSift extractFields \
+      -s "," -e "." \
+      "${RESULTS}/6_Variant_Call/${sample}.ann.vcf" \
+      POS REF ALT DP "ANN[*].EFFECT" "ANN[*].GENE" "ANN[*].GENEID" "ANN[*].HGVS_C" "ANN[*].HGVS_P" DP4 \
+      > "${RESULTS}/6_Variant_Call/${sample}.ann.tsv"
+}
+
+running_jobs=0
+
+for sfile in "${FILE_LIST[@]}"; do
+  [ -e "$sfile" ] || continue
+  info_str=$(resolve_file_info "$sfile")
+  sample=$(echo "$info_str" | cut -d'|' -f1)
+  
+  snpeff_sample "$sample" &
+  running_jobs=$((running_jobs + 1))
+  if [ "$running_jobs" -ge "$MAX_JOBS" ]; then wait -n; running_jobs=$((running_jobs - 1)); fi
+done
+wait
+
+echo ">>> Running Aggregation Steps..."
+python "${GMA_SHARE}/RAV_v1.1.py" "${RESULTS}/6_Variant_Call"
+
+if [ "$RUN_TB_PROFILER" = true ]; then
+    echo ">>> Running TB-Profiler Collate..."
+
+    cd "${RESULTS}/9_TBProfiler" || exit 1
+
+    tb-profiler collate --prefix ${Batch} --mark_missing --dir "${RESULTS}/9_TBProfiler/results/" ${TB_COLLATE_OPTS}
+
+    TB_SUMMARY_FILE="${RESULTS}/9_TBProfiler/${Batch}.txt"
+    if [ -f "$TB_SUMMARY_FILE" ]; then
+         echo ">>> Detected TB-Profiler Summary: $TB_SUMMARY_FILE"
+         MAKE_VAR_OPTS="$MAKE_VAR_OPTS --tb_summary $TB_SUMMARY_FILE"
+    else
+         echo "[WARNING] TB-Profiler summary file not found at expected path: $TB_SUMMARY_FILE"
+    fi    
+
+    cd - > /dev/null
+else
+    echo ">>> Skipping TB-Profiler Collate (Disabled by default)"
+fi
+
+if [ "$MERGE_REPORTS" = true ]; then
+    if [ "$RUN_TB_PROFILER" = true ]; then
+        MAKE_VAR_OPTS="$MAKE_VAR_OPTS --merge_reports"
+    else
+        echo "[WARNING] --merge-reports ignored because TB-Profiler was not run."
+    fi
+fi
+
+echo ">>> Making variants report with options: $MAKE_VAR_OPTS"
+
+python "${GMA_SHARE}/make_variants_MycoChaseAmp_v1.1.py" \
+    "${RESULTS}/6_Variant_Call" "${RESULTS}/${Batch}.variants.tsv" \
+    $MAKE_VAR_OPTS
+
+##############################################################################
+## MultiQC Execution
+##############################################################################
+if command -v multiqc &> /dev/null; then
+    echo ">>> Running MultiQC..."
+    mkdir -p "${RESULTS}/10_MultiQC"
+    
+    multiqc "${RESULTS}" -o "${RESULTS}/10_MultiQC" --force --interactive
+else
+    echo "[WARNING] MultiQC not found. Skipping."
+fi
+
+echo ">>> All done."
