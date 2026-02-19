@@ -19,7 +19,7 @@ It streamlines the entire process from raw data quality control to detailed clin
 
 ### 1. Installation
 
-To install GMAAMP via Conda:
+To install gmaamp via Conda:
 
 ```bash
 conda create -n gmaamp -c shyun -c conda-forge -c bioconda gmaamp
@@ -31,9 +31,9 @@ conda activate gmaamp
 Due to size constraints, the Kraken2 database is NOT included in the package. You must prepare it before running the pipeline.
 
 ```bash
-We recommend using a Kraken/Bracken database specialized for AmpliSeq.
-This specialized database is available upon request (hyun@catholic.ac.kr).
-Alternatively, you can use the Pre-built Database from the Ben Langmead Lab.
+# We recommend using a Kraken/Bracken database specialized for AmpliSeq.
+# This specialized database is available upon request (hyun@catholic.ac.kr).
+# Alternatively, you can use the Pre-built Database from the Ben Langmead Lab.
 
 # Option A: Build Standard DB
 kraken2-build --standard --threads 16 --db my_kraken_db
