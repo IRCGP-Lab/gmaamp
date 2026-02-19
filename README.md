@@ -25,7 +25,7 @@ To install GMAAMP via Conda:
 conda create -n gmaamp -c shyun -c conda-forge -c bioconda gmaamp
 
 conda activate gmaamp
-```bash
+```
 
 ### 2. Database Preparation
 Due to size constraints, the Kraken2 database is NOT included in the package. You must prepare it before running the pipeline.
@@ -40,7 +40,7 @@ kraken2-build --standard --threads 16 --db my_kraken_db
 
 # Option B: Download Pre-built Index (e.g., Ben Langmead's Index)
 # [https://benlangmead.github.io/aws-indexes/k2](https://benlangmead.github.io/aws-indexes/k2)
-```bash
+```
 
 ### 3. Usage Example
 ```bash
@@ -51,7 +51,7 @@ gmaamp \
   -t 16 \
   --run-tbprofiler \
   --pdf
-```bash
+```
 
 📚 Documentation
 📖 User Manual : https://github.com/IRCGP-Lab/gmaamp/wiki : **Go here for the Full Documentation.**
