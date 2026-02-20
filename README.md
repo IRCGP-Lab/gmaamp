@@ -54,6 +54,7 @@ gmaamp \
 ```
 
 📚 Documentation
+
 📖 User Manual : https://github.com/IRCGP-Lab/gmaamp/wiki : **Go here for the Full Documentation.**
 
 📝 Citation
