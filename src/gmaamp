@@ -1034,7 +1034,7 @@ fi
 
 echo ">>> Making variants report with options: $MAKE_VAR_OPTS"
 
-python "${GMA_SHARE}/make_variants_MycoChaseAmp_v1.1.py" \
+python "${GMA_SHARE}/make_variants_MycoChaseAmp_v1.3.py" \
     "${RESULTS}/6_Variant_Call" "${RESULTS}/${Batch}.variants.tsv" \
     $MAKE_VAR_OPTS
 

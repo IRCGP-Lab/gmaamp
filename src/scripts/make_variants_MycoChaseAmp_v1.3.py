@@ -380,56 +380,136 @@ def determine_drtb_type(d):
     if dt == "pre-XDR-TB" and (d.get("LZD")=="R" or d.get("BDQ")=="R"): dt = "XDR-TB"
     return dt
 
-def detect_large_deletions(sample):
+def detect_large_deletions(sample, sample_avg_depth):
+    """
+    Detect Large Deletions at the amplicon level using MycoChase_Amp_LD.bed.
+    - Condition 1: The sample's overall average depth must be >= 100x.
+    - Condition 2: Evaluate base-level depth. A base is 'low depth' if <= max(10, 10% of avg depth).
+    - Condition 3: An amplicon is dropped out if >= 50% of its bases are 'low depth'.
+    - Condition 4: Gene-specific streak rules (1 for small genes, 2 for large genes) 
+                   with a blacklist for known systemic false-positive regions.
+    """
     gene_to_drug = {"katG": "INH", "pncA": "PZA", "gid": "STM", "ethA": "ETO", "tlyA": "CAP"}
-    gene_coords = {
-        "katG": (2153890, 2156111),
-        "pncA": (2288682, 2289241),
-        "gid": (4407529, 4408202),
-        "ethA": (4326005, 4327473),
-        "tlyA": (1917941, 1918746)
-    }
     deletions = {}
+    
+    # 1. Check overall average depth (Condition 1: Skip detection if < 100x)
+    try:
+        avg_depth_val = float(sample_avg_depth)
+    except:
+        avg_depth_val = 0.0
+        
+    if avg_depth_val < 100.0:
+        return deletions
+
+    # 2. Load BED file and classify amplicons based on coordinates
+    # Map to the broad target regions extracted in the Bash script
+    gene_target_ranges = {
+        "katG": (2148889, 2161111),
+        "pncA": (2283681, 2294253),
+        "gid":  (4402528, 4413202),
+        "ethA": (4321004, 4332483),
+        "tlyA": (1912940, 1923746)
+    }
+    
+    bed_path = os.path.join(SCRIPT_DIR, "MycoChase_Amp_LD.bed")
+    bed_amplicons = {g: [] for g in gene_to_drug.keys()}
+    
+    if os.path.exists(bed_path):
+        with open(bed_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) < 4: continue
+                start, end, name = int(parts[1]), int(parts[2]), parts[3]
+                
+                # Accurately classify which gene region the amplicon belongs to using coordinates
+                for gene, (g_start, g_end) in gene_target_ranges.items():
+                    if g_start <= start <= g_end:
+                        bed_amplicons[gene].append((start, end, name))
+                        break
+    
+    # 3. Evaluate amplicon depth for each gene
     for gene, drug in gene_to_drug.items():
+        amplicons = sorted(bed_amplicons.get(gene, []), key=lambda x: x[0])
+        if not amplicons: continue
+        
         depth_file = os.path.join(LD_DIR, f"{sample}_{gene}.depth")
         if not os.path.exists(depth_file): continue
         
+        # Load per-base depth of the target gene into memory as a dictionary for efficiency
+        pos_depths = {}
         try:
-            with open(depth_file, 'r') as f_chk:
-                depths = [int(l.split('\t')[2]) for l in f_chk if len(l.strip().split('\t')) >= 3]
-            
-            if not depths or (sum(depths)/len(depths) < 50): continue
-            
-            g_start, g_end = gene_coords.get(gene, (0, 0))
-            
             with open(depth_file, 'r') as f:
-                lines = f.readlines()
-                consecutive_low = 0; start_del = -1; detected_regions = []
-                
-                for line in lines:
+                for line in f:
                     parts = line.strip().split('\t')
-                    if len(parts) < 3: continue
-                    pos = int(parts[1]); depth = int(parts[2])
-                    
-                    if depth <= 10:
-                        if consecutive_low == 0: start_del = pos
-                        consecutive_low += 1
-                    else:
-                        if consecutive_low >= 300:
-                            end_del = pos - 1
-                            if (start_del <= g_end and end_del >= g_start):
-                                detected_regions.append(f"{start_del}-{end_del}")
-                        consecutive_low = 0; start_del = -1
+                    if len(parts) >= 3:
+                        pos_depths[int(parts[1])] = int(parts[2])
+        except:
+            continue
+            
+        # [CORE CHANGE 1] Realistic depth cutoff (10% Rule)
+        # To ignore mapping noise or residual reads from low efficiency (e.g. 4-3-40), 
+        # use the higher value between 10x and 10% of overall average depth.
+        low_depth_threshold = max(10.0, avg_depth_val * 0.10) 
+        
+        dropout_status = []
+        for amp_start, amp_end, amp_name in amplicons:
+            amp_length = amp_end - amp_start + 1
+            low_depth_count = 0
+            
+            # [CORE CHANGE 2] Count 'Low Depth Bases' inside the amplicon
+            for pos in range(amp_start, amp_end + 1):
+                if pos_depths.get(pos, 0) <= low_depth_threshold:
+                    low_depth_count += 1
+            
+            # Even if there's a normal region overlapping with an adjacent amplicon,
+            # consider it a dropout if >= 50% of the entire amplicon length is low depth.
+            is_dropped = (low_depth_count / amp_length) >= 0.5
+            dropout_status.append(is_dropped)
+            
+        # [CORE CHANGE 3] Dual criteria for consecutive dropout based on gene size
+        # Small genes (pncA, gid, tlyA) require only 1 dropout to be deemed a Large Deletion.
+        # Large genes (katG, ethA) require 2 consecutive dropouts to prevent false positives.
+        min_streak = 1 if gene in ["pncA", "gid", "tlyA"] else 2
+        
+        # [CORE CHANGE 4] Blacklist for known systemic false-positive regions
+        # Exact match of the region string will be ignored to prevent false positives 
+        # while preserving actual larger deletions that encompass this region.
+        BLACKLIST_REGIONS = {
+            "katG": ["2154613-2155073"]
+        }
+        
+        detected_regions = []
+        streak_count = 0
+        streak_start_idx = -1
+        
+        for i, status in enumerate(dropout_status):
+            if status:
+                if streak_count == 0:
+                    streak_start_idx = i  # Remember the start index of consecutive dropouts
+                streak_count += 1
+            else:
+                if streak_count >= min_streak:
+                    start_coord = amplicons[streak_start_idx][0]
+                    end_coord = amplicons[i - 1][1]
+                    region_str = f"{start_coord}-{end_coord}"
+                    if region_str not in BLACKLIST_REGIONS.get(gene, []):
+                        detected_regions.append(region_str)
+                streak_count = 0 # Reset streak
+                streak_start_idx = -1
                 
-                if consecutive_low >= 300:
-                     end_del = int(lines[-1].strip().split('\t')[1])
-                     if (start_del <= g_end and end_del >= g_start):
-                         detected_regions.append(f"{start_del}-{end_del}")
-                         
-            if detected_regions:
-                regions_str = ",".join(detected_regions)
-                deletions[drug] = f"{gene}({regions_str})"
-        except: pass
+        # Handle the case where the array ends with a dropout state
+        if streak_count >= min_streak:
+            start_coord = amplicons[streak_start_idx][0]
+            end_coord = amplicons[len(dropout_status) - 1][1]
+            region_str = f"{start_coord}-{end_coord}"
+            if region_str not in BLACKLIST_REGIONS.get(gene, []):
+                detected_regions.append(region_str)
+                
+        # Format detected regions into a result string
+        if detected_regions:
+            regions_str = ",".join(detected_regions)
+            deletions[drug] = f"{gene}({regions_str})"
+            
     return deletions
 
 # ----------------------------------------------------------------------
@@ -437,17 +517,37 @@ def detect_large_deletions(sample):
 # ----------------------------------------------------------------------
 load_convert_db()
 
+# [MODIFIED] Safely collect samples from multiple directories
+# Non-MTB samples might lack variant calls or specific QC stats if pipeline branches early.
+def add_to_samples(sample_name):
+    if sample_name and sample_name != "*":
+        samples_set.add(sample_name)
+        init_sample(sample_name)
+
 if os.path.exists(QC_DIR):
     for f in glob.glob(os.path.join(QC_DIR, "*_dup_removed.whole.stats")):
-        s = os.path.basename(f).replace("_dup_removed.whole.stats", "")
-        samples_set.add(s)
-        init_sample(s)
+        add_to_samples(os.path.basename(f).replace("_dup_removed.whole.stats", ""))
+
+if os.path.exists(BRACKEN_DIR):
+    for f in glob.glob(os.path.join(BRACKEN_DIR, "*.S.braken")):
+        add_to_samples(os.path.basename(f).replace(".S.braken", ""))
+
+if os.path.exists(FASTQC_DIR):
+    for d in os.listdir(FASTQC_DIR):
+        if d.endswith("_fastqc") and os.path.isdir(os.path.join(FASTQC_DIR, d)):
+            s = d.replace("_Filtered_R1_fastqc", "").replace("_Filtered_R2_fastqc", "") \
+                 .replace("_R1_fastqc", "").replace("_R2_fastqc", "") \
+                 .replace("_1_fastqc", "").replace("_2_fastqc", "")
+            add_to_samples(s)
 
 pattern = os.path.join(input_dir, "*.ann.tsv.txt")
 files = sorted(glob.glob(pattern))
 
-if not files and not samples_set:
-    print(f"No input files found in {input_dir} or QC files in {QC_DIR}")
+for path in files:
+    add_to_samples(os.path.basename(path).replace(".ann.tsv.txt", ""))
+
+if not samples_set:
+    print(f"[ERROR] No samples detected in {input_dir}, {QC_DIR}, {BRACKEN_DIR}, or {FASTQC_DIR}.")
     sys.exit(1)
 
 with open(output_tsv, "w", newline="", encoding="utf-8") as out_f:
@@ -456,8 +556,8 @@ with open(output_tsv, "w", newline="", encoding="utf-8") as out_f:
 
     for path in files:
         sample = os.path.basename(path).replace(".ann.tsv.txt", "")
-        samples_set.add(sample); init_sample(sample)
-
+        # Samples already added to samples_set via add_to_samples
+        
         with open(path, "r", encoding="utf-8") as in_f:
             reader = csv.reader(in_f, delimiter="\t"); next(reader, None)
             for row in reader:
@@ -546,10 +646,17 @@ with open(merged_tsv, "w", newline="", encoding="utf-8") as out_m:
         f_reads, f_bases, f_q30 = parse_fastqc_pair(filt_r1, filt_r2)
         
         top_species, sp_reads, sp_frac = read_bracken_top_species(sample)
+        
+        # [MODIFIED] Check if species is MTBC for TSV clearing
+        mtbc_members_list = ["Mycobacterium tuberculosis", "Mycobacterium africanum", "Mycobacterium bovis", 
+                             "Mycobacterium canettii", "Mycobacterium caprae", "Mycobacterium microti", "Mycobacterium orygis"]
+        is_mtb_sample = any(mtb in str(top_species) for mtb in mtbc_members_list)
+
         wgs_qc_status = judge_wgs_qc(f_q30, qc_stats["Coverage_depth"], sp_frac)
         num_rav = rav_counts.get(sample, 0); num_other = total_variants.get(sample, 0) - num_rav
         
-        ld_results = detect_large_deletions(sample)
+        # Call detect_large_deletions with sample_avg_depth
+        ld_results = detect_large_deletions(sample, qc_stats.get("Coverage_depth", 0))
         large_deletion_hits[sample] = ld_results
         ld_summary_str = ";".join(ld_results.values()) if ld_results else "-"
         
@@ -590,23 +697,41 @@ with open(merged_tsv, "w", newline="", encoding="utf-8") as out_m:
             "SpikeIn_2_Depth": qc_stats["SpikeIn_2_Depth"],
             "SpikeIn_3_Depth": qc_stats["SpikeIn_3_Depth"]
         }
+        
+        if not is_mtb_sample:
+            # Clear extended QC and variant metrics for non-MTBC
+            fields_to_clear = [
+                "Duplicated_reads", "Duplication_rate", "Mapped_reads", "Mapped_rate",
+                "Read_length", "Insert_size", "Base_quality", "Mapping_quality",
+                "Coverage_depth", "1X_coverage_rate", "50X_coverage_rate", "100X_coverage_rate",
+                "WGS_QC", "RAV_count", "Other_variant_count", "DR_Type", "Large_deletion",
+                "On_Target_Rate", "SpikeIn_1_Depth", "SpikeIn_2_Depth", "SpikeIn_3_Depth"
+            ]
+            for f in fields_to_clear:
+                if f in row_data:
+                    row_data[f] = "-"
+
         for drug in SUMMARY_DRUG_ORDER:
-            row_data[f"{drug}_gDST"] = calls.get(drug, "S")
-            hits = hits_dict.get(drug, [])
-            
-            # [MODIFIED] Correct logic to filter out low VAF variants (which are returned as None)
-            processed_hits = [transform_hit(h) for h in hits]
-            valid_hits = [h for h in processed_hits if h is not None] # Filter out None
-            
-            formatted_hits = []
-            for h in valid_hits:
-                parts = h.split("|")
-                core = parts[0]
-                if len(parts) > 1 and parts[1]:
-                    formatted_hits.append(f"{core} ({parts[1]})")
-                else:
-                    formatted_hits.append(core)
-            row_data[f"{drug}_Mutation"] = ";".join(formatted_hits) if formatted_hits else "-"
+            if not is_mtb_sample:
+                row_data[f"{drug}_gDST"] = "-"
+                row_data[f"{drug}_Mutation"] = "-"
+            else:
+                row_data[f"{drug}_gDST"] = calls.get(drug, "S")
+                hits = hits_dict.get(drug, [])
+                
+                # [MODIFIED] Correct logic to filter out low VAF variants (which are returned as None)
+                processed_hits = [transform_hit(h) for h in hits]
+                valid_hits = [h for h in processed_hits if h is not None] # Filter out None
+                
+                formatted_hits = []
+                for h in valid_hits:
+                    parts = h.split("|")
+                    core = parts[0]
+                    if len(parts) > 1 and parts[1]:
+                        formatted_hits.append(f"{core} ({parts[1]})")
+                    else:
+                        formatted_hits.append(core)
+                row_data[f"{drug}_Mutation"] = ";".join(formatted_hits) if formatted_hits else "-"
         
         out_row = [row_data.get(col, "") for col in target_columns]
         writer.writerow(out_row)
@@ -629,23 +754,33 @@ def generate_pdf_for_sample(sample):
     elements.append(Paragraph("GenoMycAnalyzer Analysis Report", title_style))
     elements.append(Spacer(1, 2*mm))
     info = summary_front.get(sample, {})
+    species_name = info.get("Species", "-")
+    
+    mtbc_members = ["Mycobacterium tuberculosis", "Mycobacterium africanum", "Mycobacterium bovis", 
+                    "Mycobacterium canettii", "Mycobacterium caprae", "Mycobacterium microti", "Mycobacterium orygis"]
+    is_mtb = any(mtb in species_name for mtb in mtbc_members)
     
     # 1. Info & Species
-    # [MODIFIED] Added On-Target and Spike-In Info to Basic Data
+    # [MODIFIED] Check if MTB to display extended QC data, else basic info only
     basic_data = [
         ["Sample Name", sample], 
-        ["Analysis Date", date.today().strftime("%Y-%m-%d")], 
-        ["Coverage depth", info.get("Seq_Depth", "-")],
-        ["On-Target Rate", f"{info.get('On_Target_Rate', '-')}%"], # New
-        ["Spike-In Depth", f"S1:{info.get('SpikeIn_1','-')} / S2:{info.get('SpikeIn_2','-')} / S3:{info.get('SpikeIn_3','-')}"], # New
-        ["QC Status", info.get("WGS_QC", "-")]
+        ["Analysis Date", date.today().strftime("%Y-%m-%d")]
     ]
+    
+    if is_mtb:
+        basic_data.extend([
+            ["Coverage depth", info.get("Seq_Depth", "-")],
+            ["On-Target Rate", f"{info.get('On_Target_Rate', '-')}%"],
+            ["Spike-In Depth", f"S1:{info.get('SpikeIn_1','-')} / S2:{info.get('SpikeIn_2','-')} / S3:{info.get('SpikeIn_3','-')}"],
+            ["QC Status", info.get("WGS_QC", "-")]
+        ])
+
     t_basic = Table(basic_data, colWidths=[35*mm, 55*mm], rowHeights=6*mm)
     t_basic.setStyle(TableStyle([('BACKGROUND', (0, 0), (0, -1), colors.lightgrey), ('GRID', (0, 0), (-1, -1), 0.5, colors.black), ('FONTSIZE', (0,0), (-1,-1), 8), ('PADDING', (0,0), (-1,-1), 3)]))
 
     spoligo = info.get("Spoligotype", "-"); 
     if spoligo.isdigit(): spoligo = spoligo.zfill(15)
-    species_data = [["Species", info.get("Species", "-")], ["Main lineage", info.get("Main_lineage", "-")], ["Sub lineage", info.get("Sub_lineage", "-")], ["Spoligotype", spoligo]]
+    species_data = [["Species", species_name], ["Main lineage", info.get("Main_lineage", "-")], ["Sub lineage", info.get("Sub_lineage", "-")], ["Spoligotype", spoligo]]
     t_species = Table(species_data, colWidths=[35*mm, 55*mm], rowHeights=6*mm)
     t_species.setStyle(TableStyle([('BACKGROUND', (0, 0), (0, -1), colors.lightgrey), ('GRID', (0, 0), (-1, -1), 0.5, colors.black), ('FONTSIZE', (0,0), (-1,-1), 8), ('PADDING', (0,0), (-1,-1), 3)]))
 
@@ -653,8 +788,7 @@ def generate_pdf_for_sample(sample):
     master_table.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP')]))
     elements.append(master_table); elements.append(Spacer(1, 5*mm))
 
-    # 2. gDST
-    elements.append(Paragraph("Genotypic Drug Susceptibility Test (gDST)", header_style))
+    # 2. gDST Data Prep (calculated for all, but appended to elements ONLY if is_mtb)
     dst_header = ["Drug", "Status", Paragraph("Gene Target<sup>*</sup> (AA/nc change, VAF, WHO group)", small_style), "Large Deletion"]
     dst_data = [dst_header]
     
@@ -693,42 +827,47 @@ def generate_pdf_for_sample(sample):
         ld_val = ld_map.get(drug_code, "-")
         dst_data.append([full_name, status, Paragraph(mutations_str, small_style), Paragraph(ld_val, small_style)])
 
-    t_dst = Table(dst_data, colWidths=[35*mm, 15*mm, 80*mm, 40*mm], rowHeights=5.5*mm)
-    t_dst.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey), ('GRID', (0, 0), (-1, -1), 0.5, colors.black), ('FONTSIZE', (0,0), (-1,0), 9), ('ALIGN', (0,0), (-1,-1), 'LEFT'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('TEXTCOLOR', (1,1), (1,-1), colors.red), ('PADDING', (0,0), (-1,-1), 2)]))
-    for i, row in enumerate(dst_data):
-        if i > 0:
-            if row[1] == "R": t_dst.setStyle(TableStyle([('TEXTCOLOR', (1, i), (1, i), colors.red)]))
-            else: t_dst.setStyle(TableStyle([('TEXTCOLOR', (1, i), (1, i), colors.black)]))
-    elements.append(t_dst)
-    
-    footnote = """<font size=6>
-    *The target genes for resistance mutations were derived from the 'Catalogue of mutations in Mycobacterium tuberculosis complex and their association with drug resistance'. (2021, World Health Organization; Lancet Microbe. 2022;3(4):e265). 
-    Resistance (R) is reported when mutations are detected in either group 1 or group 2. 
-    AA change, amino acids change; VAF, variant allele frequency
-    </font>"""
-    elements.append(Paragraph(footnote, small_style)); elements.append(Spacer(1, 3*mm))
+    # Only display gDST Table if species is MTB
+    if is_mtb:
+        elements.append(Paragraph("Genotypic Drug Susceptibility Test (gDST)", header_style))
+        t_dst = Table(dst_data, colWidths=[35*mm, 15*mm, 80*mm, 40*mm], rowHeights=5.5*mm)
+        t_dst.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey), ('GRID', (0, 0), (-1, -1), 0.5, colors.black), ('FONTSIZE', (0,0), (-1,0), 9), ('ALIGN', (0,0), (-1,-1), 'LEFT'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('TEXTCOLOR', (1,1), (1,-1), colors.red), ('PADDING', (0,0), (-1,-1), 2)]))
+        for i, row in enumerate(dst_data):
+            if i > 0:
+                if row[1] == "R": t_dst.setStyle(TableStyle([('TEXTCOLOR', (1, i), (1, i), colors.red)]))
+                else: t_dst.setStyle(TableStyle([('TEXTCOLOR', (1, i), (1, i), colors.black)]))
+        elements.append(t_dst)
+        
+        footnote = """<font size=6>
+        *The target genes for resistance mutations were derived from the 'Catalogue of mutations in Mycobacterium tuberculosis complex and their association with drug resistance'. (2021, World Health Organization; Lancet Microbe. 2022;3(4):e265). 
+        Resistance (R) is reported when mutations are detected in either group 1 or group 2. 
+        AA change, amino acids change; VAF, variant allele frequency
+        </font>"""
+        elements.append(Paragraph(footnote, small_style)); elements.append(Spacer(1, 3*mm))
 
     # 4. Final Result
     elements.append(Paragraph("Final Result", header_style))
-    species_name = info.get("Species", "-")
     result_lines = [f"This isolate is positive for <b><i>{species_name}</i></b>."]
-    if "Mycobacterium tuberculosis" in species_name:
+    
+    if is_mtb:
         if resistant_drugs: result_lines.append(f"The isolate is resistant to <b>{', '.join(resistant_drugs)}</b>.")
         else: result_lines.append("This isolate is <b>Pan-susceptible</b>.")
+        
     t_final = Table([[Paragraph("<br/>".join(result_lines), normal_style)]], colWidths=[190*mm])
     t_final.setStyle(TableStyle([('BOX', (0, 0), (-1, -1), 1, colors.black), ('PADDING', (0, 0), (-1, -1), 6), ('VALIGN', (0, 0), (-1, -1), 'TOP')]))
     elements.append(t_final); elements.append(Spacer(1, 3*mm))
 
     # 5. Comment & Auth
-    elements.append(Paragraph("Additional Comment", header_style))
-    if heteroresistance_list:
-        heteroresistance_list = sorted(list(set(heteroresistance_list)))
-        comment_text = "<b>Heteroresistance variants detected (10% <= VAF < 75%):</b><br/>" + "<br/>".join(heteroresistance_list)
-        comment_content = Paragraph(comment_text, small_style)
-    else: comment_content = ""
-    t_comment = Table([[comment_content]], colWidths=[190*mm], rowHeights=[20*mm])
-    t_comment.setStyle(TableStyle([('BOX', (0, 0), (-1, -1), 1, colors.black), ('VALIGN', (0, 0), (-1, -1), 'TOP'), ('PADDING', (0, 0), (-1, -1), 5)]))
-    elements.append(t_comment); elements.append(Spacer(1, 3*mm))
+    if is_mtb:
+        elements.append(Paragraph("Additional Comment", header_style))
+        if heteroresistance_list:
+            heteroresistance_list = sorted(list(set(heteroresistance_list)))
+            comment_text = "<b>Heteroresistance variants detected (10% <= VAF < 75%):</b><br/>" + "<br/>".join(heteroresistance_list)
+            comment_content = Paragraph(comment_text, small_style)
+        else: comment_content = ""
+        t_comment = Table([[comment_content]], colWidths=[190*mm], rowHeights=[20*mm])
+        t_comment.setStyle(TableStyle([('BOX', (0, 0), (-1, -1), 1, colors.black), ('VALIGN', (0, 0), (-1, -1), 'TOP'), ('PADDING', (0, 0), (-1, -1), 5)]))
+        elements.append(t_comment); elements.append(Spacer(1, 3*mm))
 
     elements.append(Paragraph("Authorized By", header_style))
     auth_data = [["Reporting Laboratory", "", "Doctor's Name", ""], ["Address", "", "Signature", ""]]
@@ -874,6 +1013,12 @@ if args.merge_reports:
                 sample_id = gma_row.get("Sample", "-")
                 tbp_row = tb_records.get(sample_id, None) # Get TB-Profiler data for this sample
                 
+                # [MODIFIED] Check MTBC for Excel fallback clearing
+                species_name = gma_row.get("Species", "-")
+                mtbc_members_list = ["Mycobacterium tuberculosis", "Mycobacterium africanum", "Mycobacterium bovis", 
+                                     "Mycobacterium canettii", "Mycobacterium caprae", "Mycobacterium microti", "Mycobacterium orygis"]
+                is_mtb_excel = any(mtb in species_name for mtb in mtbc_members_list)
+
                 final_row_values = []
                 
                 for col in FINAL_COLUMN_ORDER:
@@ -925,6 +1070,11 @@ if args.merge_reports:
                     # Logic 4: Fallback for missing TBP data (Metadata/Mutations)
                     elif tbp_row is None and col.startswith("TBP_"):
                          val = "-"
+
+                    # [MODIFIED] Force clear TBP and DR fields for non-MTBC
+                    if not is_mtb_excel:
+                        if col.startswith("TBP_") or col.endswith("_gDST") or col.endswith("_Mutation"):
+                            val = "-"
 
                     final_row_values.append(clean_text(val))
                 
